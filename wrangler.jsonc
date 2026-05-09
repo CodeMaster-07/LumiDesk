@@ -1,0 +1,7 @@
+{
+  "name": "lumidesk",
+  "compatibility_date": "2026-05-09",
+  "assets": {
+    "directory": "./dist"
+  }
+}
