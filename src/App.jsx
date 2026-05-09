@@ -51,6 +51,7 @@ const AUTH_SESSION_KEY = "lumi_bot_manager_session";
 const AUTH_ID = "admin";
 const AUTH_PASSWORD = "admin123";
 const LOCK_MINUTES = 10;
+const EXPIRY_NOTIFICATION_DAYS = [3, 2, 1, 0];
 
 const DEFAULT_WEBHOOK_URL =
   "https://discord.com/api/webhooks/1502363881215889651/atAMoN9dOnAOZDgz2nim-ldtyuSgePim0h8v8nXIi4eBxVA_fRsWJ1obP50ILPQxY5uQ";
@@ -301,8 +302,13 @@ function buildNotificationItems(clients) {
         items.push({ key: `${client.id}:billing:${dueDate}:${cycle}`, type: "billing", cycle, client });
       }
     }
-    if (client.left === 3) {
-      items.push({ key: `${client.id}:expiry:${client.endDate}`, type: "expiry", client });
+    if (EXPIRY_NOTIFICATION_DAYS.includes(client.left)) {
+      items.push({
+        key: `${client.id}:expiry:${client.endDate}:${client.left}`,
+        type: "expiry",
+        daysRemaining: client.left,
+        client,
+      });
     }
   });
   return items;
@@ -340,10 +346,12 @@ function createWebhookPayload(item) {
     };
   }
 
+  const expiryLabel = item.daysRemaining === 0 ? "당일" : `${item.daysRemaining}일 전`;
+
   return {
-    content: `만료 3일전입니다. ${client.buyerId} 고객 계약 갱신 여부를 확인하세요.`,
+    content: `계약 만료 ${expiryLabel} 알림입니다. ${client.buyerId} 고객 계약 갱신 여부를 확인하세요.`,
     embeds: [{
-      title: "계약 만료 3일 전 알림",
+      title: `계약 만료 ${expiryLabel} 알림`,
       color: 0xf59e0b,
       fields: [
         { name: "구매자", value: client.buyerId, inline: true },
@@ -367,7 +375,7 @@ function createTestWebhookPayload() {
     embeds: [{
       title: "디스코드 웹훅 연결 확인",
       color: 0x8b5cf6,
-      description: "웹훅 설정이 정상적으로 연결되었습니다. 실제 운용 시에는 30일 결제일과 만료 3일 전에 자동 알림이 전송됩니다.",
+      description: "웹훅 설정이 정상적으로 연결되었습니다. 실제 운용 시에는 30일 결제일과 만료 3일/2일/1일 전, 그리고 당일에 자동 알림이 전송됩니다.",
       footer: { text: "LumiDesk 테스트 메시지" },
       timestamp: new Date().toISOString(),
     }],
@@ -422,7 +430,7 @@ export default function LumiBotManagerApp() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [editingId, setEditingId] = useState(null);
   const [form, setForm] = useState(emptyForm());
-  const [notice, setNotice] = useState("웹훅이 연결되면 1분마다 자동으로 결제일과 만료 알림을 확인합니다.");
+  const [notice, setNotice] = useState("웹훅이 연결되면 1분마다 결제일과 만료 3일/2일/1일 전 및 당일 알림을 확인합니다.");
 
   const sentNotificationsRef = useRef(getSavedNotificationLog());
   const notificationLockRef = useRef(false);
@@ -1108,7 +1116,7 @@ export default function LumiBotManagerApp() {
                 </div>
                 <div className="flex items-start gap-2.5">
                   <span className="mt-0.5 h-1.5 w-1.5 flex-shrink-0 rounded-full bg-violet-500" />
-                  만료 3일 전 갱신 알림 전송
+                  만료 3일 전, 2일 전, 1일 전, 당일 갱신 알림 전송
                 </div>
                 <div className="flex items-start gap-2.5">
                   <span className="mt-0.5 h-1.5 w-1.5 flex-shrink-0 rounded-full bg-violet-500" />
