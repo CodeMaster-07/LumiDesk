@@ -63,6 +63,11 @@ const ACCOUNT_FORMAT_LABELS = {
   unknown: "직접 확인 필요",
 };
 
+const ACCOUNT_STATUS = {
+  available: "사용 전",
+  assigned: "고객 연결",
+};
+
 const DEFAULT_WEBHOOK_URL =
   "https://discord.com/api/webhooks/1502363881215889651/atAMoN9dOnAOZDgz2nim-ldtyuSgePim0h8v8nXIi4eBxVA_fRsWJ1obP50ILPQxY5uQ";
 
@@ -245,6 +250,7 @@ function looksLikeRawCredential(value) {
 
 function emptyAccountForm() {
   return {
+    status: "available",
     clientId: "",
     promoterName: "",
     profileImageUrl: "",
@@ -259,6 +265,7 @@ function normalizeAccountRecord(record) {
   const detectedFormat = detectAccountFormat(maskedHint);
   return {
     id: record.id ?? crypto.randomUUID(),
+    status: record.status === "assigned" ? "assigned" : "available",
     clientId: String(record.clientId || "").trim(),
     promoterName: String(record.promoterName || "").trim(),
     profileImageUrl: String(record.profileImageUrl || "").trim(),
@@ -556,6 +563,7 @@ export default function LumiBotManagerApp() {
       const q = query.toLowerCase();
       if (!q) return true;
       return [
+        ACCOUNT_STATUS[record.status],
         record.clientId,
         record.promoterName,
         record.vaultReference,
@@ -578,6 +586,7 @@ export default function LumiBotManagerApp() {
 
   const accountStats = useMemo(() => ({
     total: accountRecords.length,
+    available: accountRecords.filter((record) => record.status === "available").length,
     linked: accountRecords.filter((record) => record.clientId).length,
     profiled: accountRecords.filter((record) => record.profileImageUrl).length,
     referenced: accountRecords.filter((record) => record.vaultReference).length,
@@ -661,6 +670,7 @@ export default function LumiBotManagerApp() {
   function openEditAccountForm(record) {
     setEditingAccountId(record.id);
     setAccountForm({
+      status: record.status,
       clientId: record.clientId,
       promoterName: record.promoterName,
       profileImageUrl: record.profileImageUrl,
@@ -700,7 +710,11 @@ export default function LumiBotManagerApp() {
       id: editingAccountId ?? crypto.randomUUID(),
       updatedAt: new Date().toISOString(),
     });
-    if (!payload.clientId || !payload.promoterName) return;
+    if (!payload.promoterName) return;
+    if (payload.status === "assigned" && !payload.clientId) {
+      setNotice("고객에게 연결된 계정은 고객 아이디를 함께 입력해 주세요.");
+      return;
+    }
     if (editingAccountId) {
       persistAccounts(accountRecords.map((record) => (record.id === editingAccountId ? payload : record)));
     } else {
@@ -1193,6 +1207,7 @@ export default function LumiBotManagerApp() {
           <>
             <div className="grid grid-cols-2 gap-3 sm:grid-cols-5">
               <StatChip label="전체 기록" value={accountStats.total} icon={<Shield size={14} />} color="violet" />
+              <StatChip label="사용 전" value={accountStats.available} icon={<span className="h-2 w-2 rounded-full bg-cyan-400 shadow-[0_0_8px_rgba(34,211,238,0.8)]" />} color="slate" />
               <StatChip label="고객 연결" value={accountStats.linked} icon={<Users size={14} />} color="indigo" />
               <StatChip label="프로필 연결" value={accountStats.profiled} icon={<span className="h-2 w-2 rounded-full bg-sky-400 shadow-[0_0_8px_rgba(56,189,248,0.8)]" />} color="slate" />
               <StatChip label="보관 참조" value={accountStats.referenced} icon={<Link2 size={14} />} color="emerald" />
@@ -1410,16 +1425,27 @@ export default function LumiBotManagerApp() {
               />
 
               <div className="mb-4 rounded-2xl border border-sky-500/15 bg-sky-500/[0.06] px-4 py-3 text-sm leading-relaxed text-sky-100">
-                실제 토큰, 이메일 비밀번호, 토큰 비밀번호는 여기에 넣지 마세요. `vaultReference`에는 1Password/Bitwarden 항목 ID나 링크를, `마스킹 힌트`에는 일부만 가린 식별 정보만 넣는 방식입니다.
+                실제 토큰, 이메일 비밀번호, 토큰 비밀번호는 여기에 넣지 마세요. `사용 전` 계정은 고객 없이 먼저 적재해둘 수 있고, 판매 후 `고객 연결`로 바꾸면서 고객 아이디를 붙이면 됩니다.
               </div>
 
               <div className="grid gap-4 sm:grid-cols-2">
+                <FormField label="계정 상태">
+                  <select
+                    value={accountForm.status}
+                    onChange={(e) => setAccountForm((prev) => ({ ...prev, status: e.target.value }))}
+                    className="input"
+                  >
+                    {Object.entries(ACCOUNT_STATUS).map(([key, label]) => (
+                      <option key={key} value={key}>{label}</option>
+                    ))}
+                  </select>
+                </FormField>
                 <FormField label="어떤 고객의 것인지">
                   <input
                     value={accountForm.clientId}
                     onChange={(e) => setAccountForm((prev) => ({ ...prev, clientId: e.target.value }))}
                     className="input"
-                    placeholder="discord_user_123"
+                    placeholder={accountForm.status === "available" ? "사용 전 계정이면 비워도 됩니다" : "discord_user_123"}
                     list="client-buyer-ids"
                   />
                 </FormField>
@@ -1859,6 +1885,7 @@ function ClientRow({ client, isExpanded, onToggle, onEdit, onDelete }) {
 function AccountRecordCard({ record, onEdit, onDelete }) {
   const formatLabel = ACCOUNT_FORMAT_LABELS[record.detectedFormat] || ACCOUNT_FORMAT_LABELS.unknown;
   const hasImage = Boolean(record.profileImageUrl);
+  const statusLabel = ACCOUNT_STATUS[record.status] || ACCOUNT_STATUS.available;
 
   return (
     <motion.div
@@ -1885,11 +1912,12 @@ function AccountRecordCard({ record, onEdit, onDelete }) {
           <div className="min-w-0">
             <div className="flex flex-wrap items-center gap-2">
               <h3 className="truncate text-base font-black text-white">{record.promoterName}</h3>
+              <AccountStatusBadge status={record.status} />
               <span className="rounded-full border border-violet-500/20 bg-violet-500/[0.08] px-2.5 py-1 text-[11px] font-bold text-violet-200">
-                {record.clientId || "고객 미지정"}
+                {record.clientId || (record.status === "available" ? "사용 전 계정" : "고객 미지정")}
               </span>
             </div>
-            <p className="mt-1 text-sm text-slate-400">{formatLabel}</p>
+            <p className="mt-1 text-sm text-slate-400">{statusLabel} · {formatLabel}</p>
             <div className="mt-3 grid gap-2 sm:grid-cols-2">
               <AccountMeta label="외부 보관 참조">{record.vaultReference || "참조 ID 없음"}</AccountMeta>
               <AccountMeta label="마스킹 힌트">{record.maskedHint || "마스킹 힌트 없음"}</AccountMeta>
@@ -1920,6 +1948,21 @@ function AccountRecordCard({ record, onEdit, onDelete }) {
         <div className="text-xs text-slate-500">최근 수정 {formatDateTime(record.updatedAt)}</div>
       </div>
     </motion.div>
+  );
+}
+
+function AccountStatusBadge({ status }) {
+  const config = status === "assigned"
+    ? { label: ACCOUNT_STATUS.assigned, bg: "rgba(99,102,241,0.12)", border: "rgba(99,102,241,0.3)", text: "#a5b4fc" }
+    : { label: ACCOUNT_STATUS.available, bg: "rgba(34,211,238,0.12)", border: "rgba(34,211,238,0.28)", text: "#67e8f9" };
+
+  return (
+    <span
+      className="inline-flex rounded-full px-2.5 py-1 text-[11px] font-black"
+      style={{ background: config.bg, border: `1px solid ${config.border}`, color: config.text }}
+    >
+      {config.label}
+    </span>
   );
 }
 
