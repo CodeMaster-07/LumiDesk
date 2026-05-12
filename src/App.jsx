@@ -43,6 +43,7 @@ const DISCOUNT_TYPES = {
 };
 
 const CLIENTS_STORAGE_KEY = "lumi_bot_manager_clients";
+const ACCOUNT_RECORDS_STORAGE_KEY = "lumi_bot_manager_account_records";
 const SETTINGS_STORAGE_KEY = "lumi_bot_manager_settings";
 const NOTIFICATION_STORAGE_KEY = "lumi_bot_manager_sent_notifications";
 const AUTH_STORAGE_KEY = "lumi_bot_manager_auth";
@@ -52,6 +53,15 @@ const AUTH_ID = "admin";
 const AUTH_PASSWORD = "admin123";
 const LOCK_MINUTES = 10;
 const EXPIRY_NOTIFICATION_DAYS = [3, 2, 1, 0];
+const DASHBOARD_TABS = { clients: "clients", accounts: "accounts" };
+
+const ACCOUNT_FORMAT_LABELS = {
+  four_part: "이메일 / 토큰 비밀번호 / 이메일 비밀번호 / 토큰",
+  three_part: "이메일 / 토큰 비밀번호 / 토큰",
+  two_part: "이메일 / 이메일 비밀번호",
+  token_only: "토큰만",
+  unknown: "직접 확인 필요",
+};
 
 const DEFAULT_WEBHOOK_URL =
   "https://discord.com/api/webhooks/1502363881215889651/atAMoN9dOnAOZDgz2nim-ldtyuSgePim0h8v8nXIi4eBxVA_fRsWJ1obP50ILPQxY5uQ";
@@ -137,6 +147,19 @@ function formatCurrency(amount) {
   return `${Number(amount || 0).toLocaleString("ko-KR")}원`;
 }
 
+function formatDateTime(value) {
+  if (!value) return "—";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "—";
+  return date.toLocaleString("ko-KR", {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
 function calculateEndDate(startDate, purchaseMonths) {
   const start = parseLocalDate(startDate);
   const months = Math.max(1, Number(purchaseMonths || 1));
@@ -200,6 +223,53 @@ function hasDiscount(client) {
   return Number(client.discountAmount || 0) > 0 || client.discountType !== "none";
 }
 
+function detectAccountFormat(maskedHint) {
+  const value = String(maskedHint || "").trim();
+  if (!value) return "unknown";
+  const segments = value.split(":").map((segment) => segment.trim()).filter(Boolean);
+  if (segments.length === 1) return "token_only";
+  if (segments.length === 2) return value.includes("@") ? "two_part" : "unknown";
+  if (segments.length === 3) return "three_part";
+  if (segments.length === 4) return "four_part";
+  return "unknown";
+}
+
+function looksLikeRawCredential(value) {
+  const text = String(value || "").trim();
+  if (!text) return false;
+  if (/[•*]/.test(text)) return false;
+  const segments = text.split(":").map((segment) => segment.trim()).filter(Boolean);
+  if (segments.length >= 2) return true;
+  return /[A-Za-z0-9_\-.]{24,}/.test(text);
+}
+
+function emptyAccountForm() {
+  return {
+    clientId: "",
+    promoterName: "",
+    profileImageUrl: "",
+    vaultReference: "",
+    maskedHint: "",
+    note: "",
+  };
+}
+
+function normalizeAccountRecord(record) {
+  const maskedHint = String(record.maskedHint || "").trim();
+  const detectedFormat = detectAccountFormat(maskedHint);
+  return {
+    id: record.id ?? crypto.randomUUID(),
+    clientId: String(record.clientId || "").trim(),
+    promoterName: String(record.promoterName || "").trim(),
+    profileImageUrl: String(record.profileImageUrl || "").trim(),
+    vaultReference: String(record.vaultReference || "").trim(),
+    maskedHint,
+    note: String(record.note || "").trim(),
+    detectedFormat,
+    updatedAt: record.updatedAt || new Date().toISOString(),
+  };
+}
+
 // ═══════════════════════════════════════════════════════════════
 //  Storage helpers
 // ═══════════════════════════════════════════════════════════════
@@ -216,6 +286,20 @@ function getSavedClients() {
 
 function saveClients(clients) {
   localStorage.setItem(CLIENTS_STORAGE_KEY, JSON.stringify(clients.map(normalizeClient)));
+}
+
+function getSavedAccountRecords() {
+  try {
+    const saved = localStorage.getItem(ACCOUNT_RECORDS_STORAGE_KEY);
+    const parsed = saved ? JSON.parse(saved) : [];
+    return parsed.map(normalizeAccountRecord);
+  } catch {
+    return [];
+  }
+}
+
+function saveAccountRecords(records) {
+  localStorage.setItem(ACCOUNT_RECORDS_STORAGE_KEY, JSON.stringify(records.map(normalizeAccountRecord)));
 }
 
 function getSavedSettings() {
@@ -422,14 +506,19 @@ export default function LumiBotManagerApp() {
   const [, setLockTick] = useState(0);
 
   const [clients, setClients] = useState(getSavedClients);
+  const [accountRecords, setAccountRecords] = useState(getSavedAccountRecords);
   const [settings, setSettings] = useState(getSavedSettings);
+  const [activeTab, setActiveTab] = useState(DASHBOARD_TABS.clients);
   const [query, setQuery] = useState("");
   const [filter, setFilter] = useState("all");
   const [expanded, setExpanded] = useState({});
   const [formOpen, setFormOpen] = useState(false);
+  const [accountFormOpen, setAccountFormOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [editingId, setEditingId] = useState(null);
+  const [editingAccountId, setEditingAccountId] = useState(null);
   const [form, setForm] = useState(emptyForm());
+  const [accountForm, setAccountForm] = useState(emptyAccountForm());
   const [notice, setNotice] = useState("웹훅이 연결되면 1분마다 결제일과 만료 3일/2일/1일 전 및 당일 알림을 확인합니다.");
 
   const sentNotificationsRef = useRef(getSavedNotificationLog());
@@ -462,6 +551,21 @@ export default function LumiBotManagerApp() {
     });
   }, [normalizedClients, query, filter]);
 
+  const filteredAccountRecords = useMemo(() => {
+    return accountRecords.filter((record) => {
+      const q = query.toLowerCase();
+      if (!q) return true;
+      return [
+        record.clientId,
+        record.promoterName,
+        record.vaultReference,
+        record.maskedHint,
+        record.note,
+        ACCOUNT_FORMAT_LABELS[record.detectedFormat],
+      ].some((value) => String(value || "").toLowerCase().includes(q));
+    });
+  }, [accountRecords, query]);
+
   const stats = useMemo(() => ({
     total: normalizedClients.length,
     active: normalizedClients.filter((c) => c.displayStatus === "active").length,
@@ -471,6 +575,14 @@ export default function LumiBotManagerApp() {
     revenue: normalizedClients.reduce((sum, c) => sum + c.paymentAmount, 0),
     discounted: normalizedClients.filter((c) => hasDiscount(c)).length,
   }), [normalizedClients]);
+
+  const accountStats = useMemo(() => ({
+    total: accountRecords.length,
+    linked: accountRecords.filter((record) => record.clientId).length,
+    profiled: accountRecords.filter((record) => record.profileImageUrl).length,
+    referenced: accountRecords.filter((record) => record.vaultReference).length,
+    unknownFormat: accountRecords.filter((record) => record.detectedFormat === "unknown").length,
+  }), [accountRecords]);
 
   const aiBrief = useMemo(() => {
     const expiringSoon = normalizedClients
@@ -490,10 +602,21 @@ export default function LumiBotManagerApp() {
     };
   }, [normalizedClients]);
 
+  const accountNotice =
+    notice.includes("계정") || notice.includes("원문")
+      ? notice
+      : "외부 금고 참조 ID와 마스킹 힌트만 저장합니다.";
+
   function persist(nextClients) {
     const normalized = nextClients.map(normalizeClient);
     setClients(normalized);
     saveClients(normalized);
+  }
+
+  function persistAccounts(nextRecords) {
+    const normalized = nextRecords.map(normalizeAccountRecord);
+    setAccountRecords(normalized);
+    saveAccountRecords(normalized);
   }
 
   function updateForm(patch) {
@@ -529,6 +652,31 @@ export default function LumiBotManagerApp() {
     setForm(emptyForm());
   }
 
+  function openCreateAccountForm() {
+    setEditingAccountId(null);
+    setAccountForm(emptyAccountForm());
+    setAccountFormOpen(true);
+  }
+
+  function openEditAccountForm(record) {
+    setEditingAccountId(record.id);
+    setAccountForm({
+      clientId: record.clientId,
+      promoterName: record.promoterName,
+      profileImageUrl: record.profileImageUrl,
+      vaultReference: record.vaultReference,
+      maskedHint: record.maskedHint,
+      note: record.note,
+    });
+    setAccountFormOpen(true);
+  }
+
+  function closeAccountForm() {
+    setAccountFormOpen(false);
+    setEditingAccountId(null);
+    setAccountForm(emptyAccountForm());
+  }
+
   function submitForm(event) {
     event.preventDefault();
     const payload = buildClientPayload(form);
@@ -541,8 +689,34 @@ export default function LumiBotManagerApp() {
     closeForm();
   }
 
+  function submitAccountForm(event) {
+    event.preventDefault();
+    if (looksLikeRawCredential(accountForm.maskedHint)) {
+      setNotice("계정 정리 탭에는 원문 토큰이나 비밀번호를 저장할 수 없습니다. 마스킹 힌트만 남겨주세요.");
+      return;
+    }
+    const payload = normalizeAccountRecord({
+      ...accountForm,
+      id: editingAccountId ?? crypto.randomUUID(),
+      updatedAt: new Date().toISOString(),
+    });
+    if (!payload.clientId || !payload.promoterName) return;
+    if (editingAccountId) {
+      persistAccounts(accountRecords.map((record) => (record.id === editingAccountId ? payload : record)));
+    } else {
+      persistAccounts([payload, ...accountRecords]);
+    }
+    setNotice("계정 참조 기록을 저장했습니다.");
+    closeAccountForm();
+  }
+
   function deleteClient(id) {
     persist(clients.filter((c) => c.id !== id));
+  }
+
+  function deleteAccountRecord(id) {
+    persistAccounts(accountRecords.filter((record) => record.id !== id));
+    setNotice("계정 참조 기록을 삭제했습니다.");
   }
 
   function toggleExpanded(id) {
@@ -558,6 +732,14 @@ export default function LumiBotManagerApp() {
     setIsAuthenticated(false);
     setLoginForm({ userId: "", password: "" });
     setLoginMessage("로그아웃되었습니다.");
+  }
+
+  function handleQuickAdd() {
+    if (activeTab === DASHBOARD_TABS.accounts) {
+      openCreateAccountForm();
+      return;
+    }
+    openCreateForm();
   }
 
   function handleLogin(event) {
@@ -807,14 +989,14 @@ export default function LumiBotManagerApp() {
               <Settings size={16} />
             </button>
             <button
-              onClick={openCreateForm}
+              onClick={handleQuickAdd}
               className="flex h-9 items-center gap-1.5 rounded-xl px-3 text-sm font-semibold text-white transition"
               style={{
                 background: "linear-gradient(135deg, #7c3aed, #4f46e5)",
                 boxShadow: "0 0 16px rgba(139,92,246,0.3)",
               }}
             >
-              <Plus size={15} /> 추가
+              <Plus size={15} /> {activeTab === DASHBOARD_TABS.accounts ? "계정 추가" : "추가"}
             </button>
             <button
               onClick={logout}
@@ -827,158 +1009,287 @@ export default function LumiBotManagerApp() {
       </header>
 
       <main className="mx-auto max-w-7xl space-y-5 px-5 py-6">
-
-        {/* Stats row */}
-        <div className="grid grid-cols-2 gap-3 sm:grid-cols-4 lg:grid-cols-7">
-          <StatChip label="전체" value={stats.total} icon={<Users size={14} />} color="violet" span={1} />
-          <StatChip label="계약중" value={stats.active} icon={<span className="h-2 w-2 rounded-full bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.8)]" />} color="emerald" span={1} />
-          <StatChip label="신청 전" value={stats.pending} icon={<span className="h-2 w-2 rounded-full bg-amber-400 shadow-[0_0_8px_rgba(251,191,36,0.8)]" />} color="amber" span={1} />
-          <StatChip label="만료" value={stats.expired} icon={<span className="h-2 w-2 rounded-full bg-slate-500" />} color="slate" span={1} />
-          <StatChip label="총 봇" value={`${stats.bots}개`} icon={<Bot size={14} />} color="indigo" span={1} />
-          <StatChip label="총 결제" value={formatCurrency(stats.revenue)} icon={<Wallet size={14} />} color="violet" span={1} className="col-span-2 sm:col-span-1 lg:col-span-2" />
-        </div>
-
-        {/* AI Brief */}
-        <div
-          className="rounded-2xl border border-white/[0.07] p-5"
-          style={{
-            background: "linear-gradient(135deg, rgba(139,92,246,0.08) 0%, rgba(4,6,13,0.8) 60%)",
-            borderColor: "rgba(139,92,246,0.15)",
-          }}
-        >
-          <div className="mb-4 flex items-center gap-2">
-            <div
-              className="flex h-7 w-7 items-center justify-center rounded-lg"
-              style={{ background: "rgba(139,92,246,0.2)", border: "1px solid rgba(139,92,246,0.3)" }}
-            >
-              <Sparkles size={14} className="text-violet-300" />
-            </div>
-            <span className="text-sm font-bold text-violet-200">AI 브리핑</span>
-          </div>
-          <p className="mb-4 text-base font-semibold text-white">{aiBrief.message}</p>
-          <div className="grid gap-3 sm:grid-cols-3">
-            <InsightChip
-              icon={<AlertCircle size={14} />}
-              label="곧 만료"
-              value={
-                aiBrief.expiringSoon.length
-                  ? aiBrief.expiringSoon.map((c) => `${c.buyerId} D-${c.left}`).join(", ")
-                  : "없음"
-              }
-              color="rose"
-            />
-            <InsightChip
-              icon={<Clock3 size={14} />}
-              label="신청 전"
-              value={aiBrief.pendingClients.length ? `${aiBrief.pendingClients.length}건 후속 필요` : "없음"}
-              color="amber"
-            />
-            <InsightChip
-              icon={<BadgePercent size={14} />}
-              label="할인 계약"
-              value={aiBrief.discountClients.length ? `${aiBrief.discountClients.length}건 관리 중` : "없음"}
-              color="violet"
-            />
-          </div>
-        </div>
-
-        {/* Search + Filter */}
-        <div
-          className="flex flex-col gap-3 rounded-2xl border border-white/[0.07] p-4 sm:flex-row sm:items-center"
-          style={{ background: "rgba(255,255,255,0.02)" }}
-        >
-          <div className="relative flex-1">
-            <Search className="absolute left-3.5 top-1/2 -translate-y-1/2 text-slate-500" size={16} />
-            <input
-              value={query}
-              onChange={(e) => setQuery(e.target.value)}
-              placeholder="구매자 아이디, 홍보 멘트, 비고 검색..."
-              className="h-10 w-full rounded-xl border border-white/[0.07] bg-white/[0.04] pl-10 pr-4 text-sm text-slate-100 outline-none transition placeholder:text-slate-500 focus:border-violet-500/40 focus:ring-2 focus:ring-violet-500/10"
-            />
-          </div>
-
-          <div className="flex rounded-xl border border-white/[0.07] bg-white/[0.03] p-1">
-            {[["all", "전체"], ["pending", "신청 전"], ["active", "계약중"], ["expired", "만료"]].map(([key, label]) => (
+        <div className="flex flex-col gap-3 rounded-2xl border border-white/[0.07] p-3 sm:flex-row sm:items-center sm:justify-between" style={{ background: "rgba(255,255,255,0.02)" }}>
+          <div className="flex rounded-2xl border border-white/[0.07] bg-black/20 p-1.5">
+            {[
+              [DASHBOARD_TABS.clients, "계약 관리"],
+              [DASHBOARD_TABS.accounts, "계정 정리"],
+            ].map(([key, label]) => (
               <button
                 key={key}
-                onClick={() => setFilter(key)}
-                className="relative rounded-lg px-3.5 py-1.5 text-xs font-semibold transition"
+                onClick={() => setActiveTab(key)}
+                className="relative rounded-xl px-4 py-2 text-sm font-semibold transition"
               >
-                {filter === key && (
+                {activeTab === key && (
                   <motion.span
-                    layoutId="filter-indicator"
+                    layoutId="dashboard-tab"
                     transition={spring}
-                    className="absolute inset-0 rounded-lg"
-                    style={{ background: "rgba(139,92,246,0.2)", border: "1px solid rgba(139,92,246,0.3)" }}
+                    className="absolute inset-0 rounded-xl"
+                    style={{ background: "rgba(139,92,246,0.22)", border: "1px solid rgba(139,92,246,0.3)" }}
                   />
                 )}
-                <span className={`relative z-10 ${filter === key ? "text-violet-200" : "text-slate-400"}`}>
+                <span className={`relative z-10 ${activeTab === key ? "text-violet-100" : "text-slate-400"}`}>
                   {label}
                 </span>
               </button>
             ))}
           </div>
-
-          <div className="hidden items-center gap-1.5 rounded-xl border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-xs text-slate-500 sm:flex">
-            진행중 <span className="font-bold text-emerald-400">{stats.active}</span>건
+          <div className="text-xs text-slate-500">
+            {activeTab === DASHBOARD_TABS.accounts
+              ? "원문 토큰 대신 외부 보관 참조와 마스킹 힌트만 정리합니다."
+              : "구매자 계약, 알림, 일정 상태를 한 화면에서 관리합니다."}
           </div>
         </div>
 
-        {/* Notice bar */}
-        <div className="flex items-center gap-2 rounded-xl border border-white/[0.05] px-4 py-2.5 text-xs text-slate-400" style={{ background: "rgba(255,255,255,0.02)" }}>
-          <span className="h-1.5 w-1.5 flex-shrink-0 rounded-full bg-violet-500 shadow-[0_0_6px_rgba(139,92,246,0.8)]" />
-          {notice}
-        </div>
+        {activeTab === DASHBOARD_TABS.clients ? (
+          <>
+            <div className="grid grid-cols-2 gap-3 sm:grid-cols-4 lg:grid-cols-7">
+              <StatChip label="전체" value={stats.total} icon={<Users size={14} />} color="violet" span={1} />
+              <StatChip label="계약중" value={stats.active} icon={<span className="h-2 w-2 rounded-full bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.8)]" />} color="emerald" span={1} />
+              <StatChip label="신청 전" value={stats.pending} icon={<span className="h-2 w-2 rounded-full bg-amber-400 shadow-[0_0_8px_rgba(251,191,36,0.8)]" />} color="amber" span={1} />
+              <StatChip label="만료" value={stats.expired} icon={<span className="h-2 w-2 rounded-full bg-slate-500" />} color="slate" span={1} />
+              <StatChip label="총 봇" value={`${stats.bots}개`} icon={<Bot size={14} />} color="indigo" span={1} />
+              <StatChip label="총 결제" value={formatCurrency(stats.revenue)} icon={<Wallet size={14} />} color="violet" span={1} className="col-span-2 sm:col-span-1 lg:col-span-2" />
+            </div>
 
-        {/* Client table */}
-        <div className="overflow-hidden rounded-2xl border border-white/[0.07]" style={{ background: "rgba(255,255,255,0.02)" }}>
-          {/* Table header */}
-          <div
-            className="hidden grid-cols-[1.1fr_.4fr_.5fr_.95fr_1fr_.8fr_.65fr] gap-3 border-b border-white/[0.05] px-5 py-3 text-[11px] font-bold uppercase tracking-widest text-slate-500 md:grid"
-          >
-            <div>구매자</div>
-            <div>봇</div>
-            <div>개월</div>
-            <div>결제 / 할인</div>
-            <div>계약 기간</div>
-            <div>상태</div>
-            <div className="text-right">관리</div>
-          </div>
-
-          <div className="divide-y divide-white/[0.04]">
-            <AnimatePresence initial={false} mode="popLayout">
-              {filteredClients.length === 0 ? (
-                <motion.div
-                  key="empty"
-                  initial={{ opacity: 0 }}
-                  animate={{ opacity: 1 }}
-                  exit={{ opacity: 0 }}
-                  className="py-16 text-center"
+            <div
+              className="rounded-2xl border border-white/[0.07] p-5"
+              style={{
+                background: "linear-gradient(135deg, rgba(139,92,246,0.08) 0%, rgba(4,6,13,0.8) 60%)",
+                borderColor: "rgba(139,92,246,0.15)",
+              }}
+            >
+              <div className="mb-4 flex items-center gap-2">
+                <div
+                  className="flex h-7 w-7 items-center justify-center rounded-lg"
+                  style={{ background: "rgba(139,92,246,0.2)", border: "1px solid rgba(139,92,246,0.3)" }}
                 >
-                  <div
-                    className="mx-auto mb-4 flex h-14 w-14 items-center justify-center rounded-2xl border border-white/[0.07] text-slate-600"
-                    style={{ background: "rgba(255,255,255,0.03)" }}
+                  <Sparkles size={14} className="text-violet-300" />
+                </div>
+                <span className="text-sm font-bold text-violet-200">AI 브리핑</span>
+              </div>
+              <p className="mb-4 text-base font-semibold text-white">{aiBrief.message}</p>
+              <div className="grid gap-3 sm:grid-cols-3">
+                <InsightChip
+                  icon={<AlertCircle size={14} />}
+                  label="곧 만료"
+                  value={
+                    aiBrief.expiringSoon.length
+                      ? aiBrief.expiringSoon.map((c) => `${c.buyerId} D-${c.left}`).join(", ")
+                      : "없음"
+                  }
+                  color="rose"
+                />
+                <InsightChip
+                  icon={<Clock3 size={14} />}
+                  label="신청 전"
+                  value={aiBrief.pendingClients.length ? `${aiBrief.pendingClients.length}건 후속 필요` : "없음"}
+                  color="amber"
+                />
+                <InsightChip
+                  icon={<BadgePercent size={14} />}
+                  label="할인 계약"
+                  value={aiBrief.discountClients.length ? `${aiBrief.discountClients.length}건 관리 중` : "없음"}
+                  color="violet"
+                />
+              </div>
+            </div>
+
+            <div
+              className="flex flex-col gap-3 rounded-2xl border border-white/[0.07] p-4 sm:flex-row sm:items-center"
+              style={{ background: "rgba(255,255,255,0.02)" }}
+            >
+              <div className="relative flex-1">
+                <Search className="absolute left-3.5 top-1/2 -translate-y-1/2 text-slate-500" size={16} />
+                <input
+                  value={query}
+                  onChange={(e) => setQuery(e.target.value)}
+                  placeholder="구매자 아이디, 홍보 멘트, 비고 검색..."
+                  className="h-10 w-full rounded-xl border border-white/[0.07] bg-white/[0.04] pl-10 pr-4 text-sm text-slate-100 outline-none transition placeholder:text-slate-500 focus:border-violet-500/40 focus:ring-2 focus:ring-violet-500/10"
+                />
+              </div>
+
+              <div className="flex rounded-xl border border-white/[0.07] bg-white/[0.03] p-1">
+                {[["all", "전체"], ["pending", "신청 전"], ["active", "계약중"], ["expired", "만료"]].map(([key, label]) => (
+                  <button
+                    key={key}
+                    onClick={() => setFilter(key)}
+                    className="relative rounded-lg px-3.5 py-1.5 text-xs font-semibold transition"
                   >
-                    <Search size={22} />
+                    {filter === key && (
+                      <motion.span
+                        layoutId="filter-indicator"
+                        transition={spring}
+                        className="absolute inset-0 rounded-lg"
+                        style={{ background: "rgba(139,92,246,0.2)", border: "1px solid rgba(139,92,246,0.3)" }}
+                      />
+                    )}
+                    <span className={`relative z-10 ${filter === key ? "text-violet-200" : "text-slate-400"}`}>
+                      {label}
+                    </span>
+                  </button>
+                ))}
+              </div>
+
+              <div className="hidden items-center gap-1.5 rounded-xl border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-xs text-slate-500 sm:flex">
+                진행중 <span className="font-bold text-emerald-400">{stats.active}</span>건
+              </div>
+            </div>
+
+            <div className="flex items-center gap-2 rounded-xl border border-white/[0.05] px-4 py-2.5 text-xs text-slate-400" style={{ background: "rgba(255,255,255,0.02)" }}>
+              <span className="h-1.5 w-1.5 flex-shrink-0 rounded-full bg-violet-500 shadow-[0_0_6px_rgba(139,92,246,0.8)]" />
+              {notice}
+            </div>
+
+            <div className="overflow-hidden rounded-2xl border border-white/[0.07]" style={{ background: "rgba(255,255,255,0.02)" }}>
+              <div
+                className="hidden grid-cols-[1.1fr_.4fr_.5fr_.95fr_1fr_.8fr_.65fr] gap-3 border-b border-white/[0.05] px-5 py-3 text-[11px] font-bold uppercase tracking-widest text-slate-500 md:grid"
+              >
+                <div>구매자</div>
+                <div>봇</div>
+                <div>개월</div>
+                <div>결제 / 할인</div>
+                <div>계약 기간</div>
+                <div>상태</div>
+                <div className="text-right">관리</div>
+              </div>
+
+              <div className="divide-y divide-white/[0.04]">
+                <AnimatePresence initial={false} mode="popLayout">
+                  {filteredClients.length === 0 ? (
+                    <motion.div
+                      key="empty"
+                      initial={{ opacity: 0 }}
+                      animate={{ opacity: 1 }}
+                      exit={{ opacity: 0 }}
+                      className="py-16 text-center"
+                    >
+                      <div
+                        className="mx-auto mb-4 flex h-14 w-14 items-center justify-center rounded-2xl border border-white/[0.07] text-slate-600"
+                        style={{ background: "rgba(255,255,255,0.03)" }}
+                      >
+                        <Search size={22} />
+                      </div>
+                      <p className="font-bold text-slate-300">검색 결과가 없습니다</p>
+                      <p className="mt-1 text-sm text-slate-600">다른 키워드로 검색하거나 새 구매자를 추가하세요.</p>
+                    </motion.div>
+                  ) : (
+                    filteredClients.map((client) => (
+                      <ClientRow
+                        key={client.id}
+                        client={client}
+                        isExpanded={!!expanded[client.id]}
+                        onToggle={() => toggleExpanded(client.id)}
+                        onEdit={() => openEditForm(client)}
+                        onDelete={() => deleteClient(client.id)}
+                      />
+                    ))
+                  )}
+                </AnimatePresence>
+              </div>
+            </div>
+          </>
+        ) : (
+          <>
+            <div className="grid grid-cols-2 gap-3 sm:grid-cols-5">
+              <StatChip label="전체 기록" value={accountStats.total} icon={<Shield size={14} />} color="violet" />
+              <StatChip label="고객 연결" value={accountStats.linked} icon={<Users size={14} />} color="indigo" />
+              <StatChip label="프로필 연결" value={accountStats.profiled} icon={<span className="h-2 w-2 rounded-full bg-sky-400 shadow-[0_0_8px_rgba(56,189,248,0.8)]" />} color="slate" />
+              <StatChip label="보관 참조" value={accountStats.referenced} icon={<Link2 size={14} />} color="emerald" />
+              <StatChip label="형식 확인 필요" value={accountStats.unknownFormat} icon={<AlertCircle size={14} />} color="amber" className="col-span-2 sm:col-span-1" />
+            </div>
+
+            <div className="grid gap-4 lg:grid-cols-[1.2fr_.8fr]">
+              <div
+                className="rounded-2xl border border-white/[0.07] p-5"
+                style={{
+                  background: "linear-gradient(135deg, rgba(56,189,248,0.08) 0%, rgba(4,6,13,0.84) 58%)",
+                  borderColor: "rgba(56,189,248,0.16)",
+                }}
+              >
+                <div className="mb-4 flex items-center gap-2">
+                  <div
+                    className="flex h-8 w-8 items-center justify-center rounded-lg"
+                    style={{ background: "rgba(56,189,248,0.12)", border: "1px solid rgba(56,189,248,0.2)" }}
+                  >
+                    <Shield size={15} className="text-sky-300" />
                   </div>
-                  <p className="font-bold text-slate-300">검색 결과가 없습니다</p>
-                  <p className="mt-1 text-sm text-slate-600">다른 키워드로 검색하거나 새 구매자를 추가하세요.</p>
-                </motion.div>
-              ) : (
-                filteredClients.map((client) => (
-                  <ClientRow
-                    key={client.id}
-                    client={client}
-                    isExpanded={!!expanded[client.id]}
-                    onToggle={() => toggleExpanded(client.id)}
-                    onEdit={() => openEditForm(client)}
-                    onDelete={() => deleteClient(client.id)}
-                  />
-                ))
-              )}
-            </AnimatePresence>
-          </div>
-        </div>
+                  <span className="text-sm font-bold text-sky-100">계정 정리 가이드</span>
+                </div>
+                <p className="text-base font-semibold text-white">원문 토큰과 비밀번호는 이 앱에 저장하지 않고, 외부 금고 참조와 마스킹 힌트만 남겨두세요.</p>
+                <div className="mt-4 grid gap-3 sm:grid-cols-2">
+                  <InsightChip icon={<Link2 size={14} />} label="외부 금고 참조" value="1Password / Bitwarden 항목 ID나 링크만 보관" color="violet" />
+                  <InsightChip icon={<MessageSquare size={14} />} label="마스킹 힌트" value="예: user@site.com:••••:••••:tok_•••• 형태만 기록" color="amber" />
+                </div>
+              </div>
+
+              <div className="rounded-2xl border border-white/[0.07] bg-white/[0.02] p-5">
+                <div className="mb-3 text-[10px] font-bold uppercase tracking-widest text-slate-500">자동 분류 형식</div>
+                <div className="space-y-2 text-sm text-slate-300">
+                  {Object.entries(ACCOUNT_FORMAT_LABELS).filter(([key]) => key !== "unknown").map(([key, label]) => (
+                    <div key={key} className="flex items-center justify-between rounded-xl border border-white/[0.06] bg-white/[0.02] px-3 py-2">
+                      <span>{label}</span>
+                      <span className="text-xs text-slate-500">{key}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+
+            <div
+              className="flex flex-col gap-3 rounded-2xl border border-white/[0.07] p-4 sm:flex-row sm:items-center"
+              style={{ background: "rgba(255,255,255,0.02)" }}
+            >
+              <div className="relative flex-1">
+                <Search className="absolute left-3.5 top-1/2 -translate-y-1/2 text-slate-500" size={16} />
+                <input
+                  value={query}
+                  onChange={(e) => setQuery(e.target.value)}
+                  placeholder="고객, 홍보 계정명, 보관 참조 ID, 메모 검색..."
+                  className="h-10 w-full rounded-xl border border-white/[0.07] bg-white/[0.04] pl-10 pr-4 text-sm text-slate-100 outline-none transition placeholder:text-slate-500 focus:border-violet-500/40 focus:ring-2 focus:ring-violet-500/10"
+                />
+              </div>
+
+              <div className="rounded-xl border border-sky-500/15 bg-sky-500/[0.06] px-3.5 py-2 text-xs text-sky-100">
+                토큰 원문 저장 금지
+              </div>
+            </div>
+
+            <div className="flex items-center gap-2 rounded-xl border border-white/[0.05] px-4 py-2.5 text-xs text-slate-400" style={{ background: "rgba(255,255,255,0.02)" }}>
+              <span className="h-1.5 w-1.5 flex-shrink-0 rounded-full bg-sky-400 shadow-[0_0_6px_rgba(56,189,248,0.8)]" />
+              {accountNotice}
+            </div>
+
+            <div className="grid gap-4">
+              <AnimatePresence initial={false}>
+                {filteredAccountRecords.length === 0 ? (
+                  <motion.div
+                    key="account-empty"
+                    initial={{ opacity: 0 }}
+                    animate={{ opacity: 1 }}
+                    exit={{ opacity: 0 }}
+                    className="rounded-2xl border border-white/[0.07] bg-white/[0.02] py-16 text-center"
+                  >
+                    <div className="mx-auto mb-4 flex h-14 w-14 items-center justify-center rounded-2xl border border-white/[0.07] text-slate-600" style={{ background: "rgba(255,255,255,0.03)" }}>
+                      <Shield size={22} />
+                    </div>
+                    <p className="font-bold text-slate-300">아직 정리된 계정 기록이 없습니다</p>
+                    <p className="mt-1 text-sm text-slate-600">우측 상단의 계정 추가 버튼으로 안전한 참조 기록부터 만들어보세요.</p>
+                  </motion.div>
+                ) : (
+                  filteredAccountRecords.map((record) => (
+                    <AccountRecordCard
+                      key={record.id}
+                      record={record}
+                      onEdit={() => openEditAccountForm(record)}
+                      onDelete={() => deleteAccountRecord(record.id)}
+                    />
+                  ))
+                )}
+              </AnimatePresence>
+            </div>
+          </>
+        )}
       </main>
 
       {/* Form modal */}
@@ -1078,6 +1389,114 @@ export default function LumiBotManagerApp() {
         )}
       </AnimatePresence>
 
+      <AnimatePresence>
+        {accountFormOpen && (
+          <Overlay onClose={closeAccountForm}>
+            <motion.form
+              layout
+              transition={spring}
+              initial={{ opacity: 0, y: 20, scale: 0.97 }}
+              animate={{ opacity: 1, y: 0, scale: 1 }}
+              exit={{ opacity: 0, y: 20, scale: 0.97 }}
+              onSubmit={submitAccountForm}
+              className="w-full max-w-3xl rounded-3xl border border-white/[0.08] p-6 shadow-[0_40px_100px_rgba(0,0,0,0.6)]"
+              style={{ background: "rgba(8,12,22,0.98)", backdropFilter: "blur(32px)" }}
+              onClick={(e) => e.stopPropagation()}
+            >
+              <ModalHeader
+                title={editingAccountId ? "계정 기록 수정" : "계정 기록 추가"}
+                description="원문 토큰 대신 외부 금고 참조와 마스킹 힌트만 기록합니다."
+                onClose={closeAccountForm}
+              />
+
+              <div className="mb-4 rounded-2xl border border-sky-500/15 bg-sky-500/[0.06] px-4 py-3 text-sm leading-relaxed text-sky-100">
+                실제 토큰, 이메일 비밀번호, 토큰 비밀번호는 여기에 넣지 마세요. `vaultReference`에는 1Password/Bitwarden 항목 ID나 링크를, `마스킹 힌트`에는 일부만 가린 식별 정보만 넣는 방식입니다.
+              </div>
+
+              <div className="grid gap-4 sm:grid-cols-2">
+                <FormField label="어떤 고객의 것인지">
+                  <input
+                    value={accountForm.clientId}
+                    onChange={(e) => setAccountForm((prev) => ({ ...prev, clientId: e.target.value }))}
+                    className="input"
+                    placeholder="discord_user_123"
+                    list="client-buyer-ids"
+                  />
+                </FormField>
+                <FormField label="홍보 계정 표시명">
+                  <input
+                    value={accountForm.promoterName}
+                    onChange={(e) => setAccountForm((prev) => ({ ...prev, promoterName: e.target.value }))}
+                    className="input"
+                    placeholder="promo_worker_alpha"
+                  />
+                </FormField>
+                <FormField label="프로필 이미지 URL">
+                  <input
+                    value={accountForm.profileImageUrl}
+                    onChange={(e) => setAccountForm((prev) => ({ ...prev, profileImageUrl: e.target.value }))}
+                    className="input"
+                    placeholder="https://cdn.example.com/avatar.png"
+                  />
+                </FormField>
+                <FormField label="외부 보관 참조 ID">
+                  <input
+                    value={accountForm.vaultReference}
+                    onChange={(e) => setAccountForm((prev) => ({ ...prev, vaultReference: e.target.value }))}
+                    className="input"
+                    placeholder="1password://vault/item-id"
+                  />
+                </FormField>
+              </div>
+
+              <div className="mt-4 grid gap-4 lg:grid-cols-[1.1fr_.9fr]">
+                <FormField label="마스킹 힌트">
+                  <textarea
+                    value={accountForm.maskedHint}
+                    onChange={(e) => setAccountForm((prev) => ({ ...prev, maskedHint: e.target.value }))}
+                    rows={4}
+                    className="input resize-none py-3"
+                    style={{ height: "auto" }}
+                    placeholder="user@site.com:••••:••••:tok_••••"
+                  />
+                </FormField>
+                <div className="rounded-2xl border border-white/[0.07] bg-white/[0.02] p-4">
+                  <p className="mb-3 text-[10px] font-bold uppercase tracking-widest text-slate-500">자동 감지 형식</p>
+                  <div className="rounded-xl border border-violet-500/20 bg-violet-500/[0.06] px-4 py-3 text-sm font-semibold text-violet-100">
+                    {ACCOUNT_FORMAT_LABELS[detectAccountFormat(accountForm.maskedHint)]}
+                  </div>
+                  <p className="mt-3 text-xs leading-relaxed text-slate-500">
+                    콜론(`:`) 개수와 이메일 포함 여부를 보고 형식을 분류합니다. 감지 결과가 애매하면 저장 후 `직접 확인 필요`로 표시됩니다.
+                  </p>
+                </div>
+              </div>
+
+              <div className="mt-4">
+                <FormField label="메모">
+                  <textarea
+                    value={accountForm.note}
+                    onChange={(e) => setAccountForm((prev) => ({ ...prev, note: e.target.value }))}
+                    rows={4}
+                    className="input resize-none py-3"
+                    style={{ height: "auto" }}
+                    placeholder="계정 상태, 주의사항, 금고 위치 설명 등을 적어두세요."
+                  />
+                </FormField>
+              </div>
+
+              <div className="mt-5 flex gap-2">
+                <Button type="submit" className="h-11 flex-1 rounded-xl text-sm">
+                  <Save size={16} className="mr-2" /> 저장하기
+                </Button>
+                <Button type="button" variant="outline" onClick={closeAccountForm} className="h-11 rounded-xl px-5">
+                  취소
+                </Button>
+              </div>
+            </motion.form>
+          </Overlay>
+        )}
+      </AnimatePresence>
+
       {/* Settings modal */}
       <AnimatePresence>
         {settingsOpen && (
@@ -1135,6 +1554,12 @@ export default function LumiBotManagerApp() {
           </Overlay>
         )}
       </AnimatePresence>
+
+      <datalist id="client-buyer-ids">
+        {normalizedClients.map((client) => (
+          <option key={client.id} value={client.buyerId} />
+        ))}
+      </datalist>
 
       <style>{inputStyle}</style>
     </div>
@@ -1428,6 +1853,82 @@ function ClientRow({ client, isExpanded, onToggle, onEdit, onDelete }) {
         )}
       </AnimatePresence>
     </motion.div>
+  );
+}
+
+function AccountRecordCard({ record, onEdit, onDelete }) {
+  const formatLabel = ACCOUNT_FORMAT_LABELS[record.detectedFormat] || ACCOUNT_FORMAT_LABELS.unknown;
+  const hasImage = Boolean(record.profileImageUrl);
+
+  return (
+    <motion.div
+      layout
+      transition={spring}
+      initial={{ opacity: 0, y: 6 }}
+      animate={{ opacity: 1, y: 0 }}
+      exit={{ opacity: 0, y: -6 }}
+      className="rounded-2xl border border-white/[0.07] bg-white/[0.02] p-4"
+    >
+      <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
+        <div className="flex min-w-0 gap-4">
+          <div
+            className="flex h-14 w-14 flex-shrink-0 items-center justify-center overflow-hidden rounded-2xl border border-white/[0.08] bg-white/[0.04]"
+            style={{ boxShadow: hasImage ? "0 0 18px rgba(56,189,248,0.12)" : "none" }}
+          >
+            {hasImage ? (
+              <img src={record.profileImageUrl} alt={record.promoterName} className="h-full w-full object-cover" />
+            ) : (
+              <span className="text-sm font-black text-slate-500">{record.promoterName.slice(0, 1) || "?"}</span>
+            )}
+          </div>
+
+          <div className="min-w-0">
+            <div className="flex flex-wrap items-center gap-2">
+              <h3 className="truncate text-base font-black text-white">{record.promoterName}</h3>
+              <span className="rounded-full border border-violet-500/20 bg-violet-500/[0.08] px-2.5 py-1 text-[11px] font-bold text-violet-200">
+                {record.clientId || "고객 미지정"}
+              </span>
+            </div>
+            <p className="mt-1 text-sm text-slate-400">{formatLabel}</p>
+            <div className="mt-3 grid gap-2 sm:grid-cols-2">
+              <AccountMeta label="외부 보관 참조">{record.vaultReference || "참조 ID 없음"}</AccountMeta>
+              <AccountMeta label="마스킹 힌트">{record.maskedHint || "마스킹 힌트 없음"}</AccountMeta>
+            </div>
+          </div>
+        </div>
+
+        <div className="flex flex-shrink-0 gap-1.5 self-end lg:self-start">
+          <button
+            onClick={onEdit}
+            className="flex h-9 w-9 items-center justify-center rounded-xl border border-white/[0.07] text-slate-400 transition hover:border-violet-500/30 hover:bg-violet-500/[0.08] hover:text-violet-300"
+          >
+            <Pencil size={14} />
+          </button>
+          <button
+            onClick={onDelete}
+            className="flex h-9 w-9 items-center justify-center rounded-xl border border-rose-500/[0.15] bg-rose-500/[0.06] text-rose-400 transition hover:border-rose-500/30 hover:bg-rose-500/[0.12]"
+          >
+            <Trash2 size={14} />
+          </button>
+        </div>
+      </div>
+
+      <div className="mt-4 grid gap-3 sm:grid-cols-[1fr_auto] sm:items-end">
+        <div className="rounded-xl border border-white/[0.06] bg-black/10 px-4 py-3 text-sm text-slate-300">
+          {record.note || <span className="text-slate-600">메모 없음</span>}
+        </div>
+        <div className="text-xs text-slate-500">최근 수정 {formatDateTime(record.updatedAt)}</div>
+      </div>
+    </motion.div>
+  );
+}
+
+function AccountMeta({ label, children }) {
+  return (
+    <div className="rounded-xl border border-white/[0.06] bg-white/[0.02] px-3 py-2.5">
+      <div className="mb-1 text-[10px] font-bold uppercase tracking-widest text-slate-500">{label}</div>
+      <div className="break-all text-sm text-slate-200">{children}</div>
+    </div>
   );
 }
 
