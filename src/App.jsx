@@ -242,15 +242,6 @@ function detectAccountFormat(maskedHint) {
   return "unknown";
 }
 
-function looksLikeRawCredential(value) {
-  const text = String(value || "").trim();
-  if (!text) return false;
-  if (/[•*]/.test(text)) return false;
-  const segments = text.split(":").map((segment) => segment.trim()).filter(Boolean);
-  if (segments.length >= 2) return true;
-  return /[A-Za-z0-9_\-.]{24,}/.test(text);
-}
-
 function readFileAsDataUrl(file) {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -713,7 +704,7 @@ export default function LumiBotManagerApp() {
   const accountNotice =
     notice.includes("계정") || notice.includes("원문")
       ? notice
-      : "외부 금고 참조 ID와 마스킹 힌트만 저장합니다.";
+      : "토큰, 비밀번호, 외부 보관 참조를 함께 저장합니다.";
 
   function persist(nextClients) {
     const normalized = nextClients.map(normalizeClient);
@@ -827,10 +818,6 @@ export default function LumiBotManagerApp() {
 
   async function submitAccountForm(event) {
     event.preventDefault();
-    if (looksLikeRawCredential(accountForm.maskedHint)) {
-      setAccountFormMessage("원문 토큰이나 비밀번호는 저장할 수 없습니다. 마스킹 힌트만 남겨주세요.");
-      return;
-    }
     const payload = normalizeAccountRecord({
       ...accountForm,
       id: editingAccountId ?? crypto.randomUUID(),
@@ -850,7 +837,7 @@ export default function LumiBotManagerApp() {
       } else {
         await persistAccounts([payload, ...accountRecords]);
       }
-      setNotice("계정 참조 기록을 저장했습니다.");
+      setNotice("계정 정보를 저장했습니다.");
       closeAccountForm();
     } catch (error) {
       setAccountFormMessage(error instanceof Error ? error.message : "계정 기록 저장에 실패했습니다.");
@@ -1184,7 +1171,7 @@ export default function LumiBotManagerApp() {
           </div>
           <div className="text-xs text-slate-500">
             {activeTab === DASHBOARD_TABS.accounts
-              ? "원문 토큰 대신 외부 보관 참조와 마스킹 힌트만 정리합니다."
+              ? "토큰, 비밀번호, 외부 보관 참조를 한곳에서 정리합니다."
               : "구매자 계약, 알림, 일정 상태를 한 화면에서 관리합니다."}
           </div>
         </div>
@@ -1365,10 +1352,10 @@ export default function LumiBotManagerApp() {
                   </div>
                   <span className="text-sm font-bold text-sky-100">계정 정리 가이드</span>
                 </div>
-                <p className="text-base font-semibold text-white">원문 토큰과 비밀번호는 이 앱에 저장하지 않고, 외부 금고 참조와 마스킹 힌트만 남겨두세요.</p>
+                <p className="text-base font-semibold text-white">원문 토큰, 비밀번호, 외부 금고 참조를 이 앱에 함께 저장할 수 있습니다.</p>
                 <div className="mt-4 grid gap-3 sm:grid-cols-2">
                   <InsightChip icon={<Link2 size={14} />} label="외부 금고 참조" value="1Password / Bitwarden 항목 ID나 링크만 보관" color="violet" />
-                  <InsightChip icon={<MessageSquare size={14} />} label="마스킹 힌트" value="예: user@site.com:••••:••••:tok_•••• 형태만 기록" color="amber" />
+                  <InsightChip icon={<MessageSquare size={14} />} label="계정 정보" value="예: user@site.com:token-pass:mail-pass:tok_xxxx" color="amber" />
                 </div>
               </div>
 
@@ -1400,7 +1387,7 @@ export default function LumiBotManagerApp() {
               </div>
 
               <div className="rounded-xl border border-sky-500/15 bg-sky-500/[0.06] px-3.5 py-2 text-xs text-sky-100">
-                토큰 원문 저장 금지
+                토큰/비밀번호 저장 가능
               </div>
             </div>
 
@@ -1554,12 +1541,12 @@ export default function LumiBotManagerApp() {
             >
               <ModalHeader
                 title={editingAccountId ? "계정 기록 수정" : "계정 기록 추가"}
-                description="원문 토큰 대신 외부 금고 참조와 마스킹 힌트만 기록합니다."
+                description="토큰, 비밀번호, 외부 금고 참조를 함께 기록합니다."
                 onClose={closeAccountForm}
               />
 
               <div className="mb-4 rounded-2xl border border-sky-500/15 bg-sky-500/[0.06] px-4 py-3 text-sm leading-relaxed text-sky-100">
-                실제 토큰, 이메일 비밀번호, 토큰 비밀번호는 여기에 넣지 마세요. `사용 전` 계정은 고객 없이 먼저 적재해둘 수 있고, 판매 후 `고객 연결`로 바꾸면서 고객 아이디를 붙이면 됩니다.
+                실제 토큰, 이메일 비밀번호, 토큰 비밀번호를 그대로 저장할 수 있습니다. `사용 전` 계정은 고객 없이 먼저 적재해둘 수 있고, 판매 후 `고객 연결`로 바꾸면서 고객 아이디를 붙이면 됩니다.
               </div>
 
               <div className="grid gap-4 sm:grid-cols-2">
@@ -1636,14 +1623,14 @@ export default function LumiBotManagerApp() {
               </div>
 
               <div className="mt-4 grid gap-4 lg:grid-cols-[1.1fr_.9fr]">
-                <FormField label="마스킹 힌트">
+                <FormField label="계정 정보">
                   <textarea
                     value={accountForm.maskedHint}
                     onChange={(e) => setAccountForm((prev) => ({ ...prev, maskedHint: e.target.value }))}
                     rows={4}
                     className="input resize-none py-3"
                     style={{ height: "auto" }}
-                    placeholder="user@site.com:••••:••••:tok_••••"
+                    placeholder="user@site.com:token-pass:mail-pass:tok_xxxx"
                   />
                 </FormField>
                 <div className="rounded-2xl border border-white/[0.07] bg-white/[0.02] p-4">
@@ -1652,7 +1639,7 @@ export default function LumiBotManagerApp() {
                     {ACCOUNT_FORMAT_LABELS[detectAccountFormat(accountForm.maskedHint)]}
                   </div>
                   <p className="mt-3 text-xs leading-relaxed text-slate-500">
-                    콜론(`:`) 개수와 이메일 포함 여부를 보고 형식을 분류합니다. 감지 결과가 애매하면 저장 후 `직접 확인 필요`로 표시됩니다.
+                    입력한 계정 정보의 콜론(`:`) 개수와 이메일 포함 여부를 보고 형식을 분류합니다. 감지 결과가 애매하면 저장 후 `직접 확인 필요`로 표시됩니다.
                   </p>
                 </div>
               </div>
@@ -2084,7 +2071,7 @@ function AccountRecordCard({ record, onEdit, onDelete }) {
             <p className="mt-1 text-sm text-slate-400">{statusLabel} · {formatLabel}</p>
             <div className="mt-3 grid gap-2 sm:grid-cols-2">
               <AccountMeta label="외부 보관 참조">{record.vaultReference || "참조 ID 없음"}</AccountMeta>
-              <AccountMeta label="마스킹 힌트">{record.maskedHint || "마스킹 힌트 없음"}</AccountMeta>
+              <AccountMeta label="계정 정보">{record.maskedHint || "저장된 정보 없음"}</AccountMeta>
             </div>
           </div>
         </div>
