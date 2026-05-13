@@ -44,6 +44,9 @@ const DISCOUNT_TYPES = {
 
 const CLIENTS_STORAGE_KEY = "lumi_bot_manager_clients";
 const ACCOUNT_RECORDS_STORAGE_KEY = "lumi_bot_manager_account_records";
+const ACCOUNT_DB_NAME = "lumi_desk_accounts";
+const ACCOUNT_DB_VERSION = 1;
+const ACCOUNT_DB_STORE = "account_records";
 const SETTINGS_STORAGE_KEY = "lumi_bot_manager_settings";
 const NOTIFICATION_STORAGE_KEY = "lumi_bot_manager_sent_notifications";
 const AUTH_STORAGE_KEY = "lumi_bot_manager_auth";
@@ -286,6 +289,92 @@ function normalizeAccountRecord(record) {
   };
 }
 
+function openAccountRecordDb() {
+  return new Promise((resolve, reject) => {
+    if (typeof indexedDB === "undefined") {
+      reject(new Error("이 브라우저에서는 계정 기록 저장소를 사용할 수 없습니다."));
+      return;
+    }
+    const request = indexedDB.open(ACCOUNT_DB_NAME, ACCOUNT_DB_VERSION);
+    request.onupgradeneeded = () => {
+      const db = request.result;
+      if (!db.objectStoreNames.contains(ACCOUNT_DB_STORE)) {
+        db.createObjectStore(ACCOUNT_DB_STORE, { keyPath: "id" });
+      }
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(new Error("계정 기록 저장소를 여는 중 오류가 발생했습니다."));
+  });
+}
+
+function getLegacySavedAccountRecords() {
+  try {
+    const saved = localStorage.getItem(ACCOUNT_RECORDS_STORAGE_KEY);
+    const parsed = saved ? JSON.parse(saved) : [];
+    return parsed.map(normalizeAccountRecord);
+  } catch {
+    return [];
+  }
+}
+
+async function getSavedAccountRecords() {
+  if (typeof indexedDB === "undefined") return getLegacySavedAccountRecords();
+  const db = await openAccountRecordDb();
+  try {
+    const records = await new Promise((resolve, reject) => {
+      const tx = db.transaction(ACCOUNT_DB_STORE, "readonly");
+      const request = tx.objectStore(ACCOUNT_DB_STORE).getAll();
+      request.onsuccess = () => resolve(request.result || []);
+      request.onerror = () => reject(new Error("계정 기록을 불러오는 중 오류가 발생했습니다."));
+    });
+    const normalized = records.map(normalizeAccountRecord);
+    if (normalized.length > 0) return normalized;
+
+    const legacy = getLegacySavedAccountRecords();
+    if (legacy.length > 0) {
+      await saveAccountRecords(legacy);
+      try {
+        localStorage.removeItem(ACCOUNT_RECORDS_STORAGE_KEY);
+      } catch {
+        // Ignore localStorage cleanup failures after migration.
+      }
+    }
+    return legacy;
+  } finally {
+    db.close();
+  }
+}
+
+async function saveAccountRecords(records) {
+  const normalized = records.map(normalizeAccountRecord);
+  if (typeof indexedDB === "undefined") {
+    localStorage.setItem(ACCOUNT_RECORDS_STORAGE_KEY, JSON.stringify(normalized));
+    return;
+  }
+  const db = await openAccountRecordDb();
+  try {
+    await new Promise((resolve, reject) => {
+      const tx = db.transaction(ACCOUNT_DB_STORE, "readwrite");
+      const store = tx.objectStore(ACCOUNT_DB_STORE);
+      const clearRequest = store.clear();
+      clearRequest.onerror = () => reject(new Error("기존 계정 기록을 정리하는 중 오류가 발생했습니다."));
+      clearRequest.onsuccess = () => {
+        normalized.forEach((record) => store.put(record));
+      };
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(new Error("계정 기록 저장에 실패했습니다."));
+      tx.onabort = () => reject(new Error("계정 기록 저장이 중단되었습니다."));
+    });
+    try {
+      localStorage.removeItem(ACCOUNT_RECORDS_STORAGE_KEY);
+    } catch {
+      // Ignore localStorage cleanup failures after successful IndexedDB save.
+    }
+  } finally {
+    db.close();
+  }
+}
+
 // ═══════════════════════════════════════════════════════════════
 //  Storage helpers
 // ═══════════════════════════════════════════════════════════════
@@ -302,20 +391,6 @@ function getSavedClients() {
 
 function saveClients(clients) {
   localStorage.setItem(CLIENTS_STORAGE_KEY, JSON.stringify(clients.map(normalizeClient)));
-}
-
-function getSavedAccountRecords() {
-  try {
-    const saved = localStorage.getItem(ACCOUNT_RECORDS_STORAGE_KEY);
-    const parsed = saved ? JSON.parse(saved) : [];
-    return parsed.map(normalizeAccountRecord);
-  } catch {
-    return [];
-  }
-}
-
-function saveAccountRecords(records) {
-  localStorage.setItem(ACCOUNT_RECORDS_STORAGE_KEY, JSON.stringify(records.map(normalizeAccountRecord)));
 }
 
 function getSavedSettings() {
@@ -522,7 +597,7 @@ export default function LumiBotManagerApp() {
   const [, setLockTick] = useState(0);
 
   const [clients, setClients] = useState(getSavedClients);
-  const [accountRecords, setAccountRecords] = useState(getSavedAccountRecords);
+  const [accountRecords, setAccountRecords] = useState([]);
   const [settings, setSettings] = useState(getSavedSettings);
   const [activeTab, setActiveTab] = useState(DASHBOARD_TABS.clients);
   const [query, setQuery] = useState("");
@@ -545,6 +620,20 @@ export default function LumiBotManagerApp() {
     const id = window.setInterval(() => setLockTick(Date.now()), 1000);
     return () => window.clearInterval(id);
   }, [authState]);
+
+  useEffect(() => {
+    let cancelled = false;
+    getSavedAccountRecords()
+      .then((records) => {
+        if (!cancelled) setAccountRecords(records);
+      })
+      .catch(() => {
+        if (!cancelled) setAccountRecords(getLegacySavedAccountRecords());
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const normalizedClients = useMemo(() => {
     return clients.map((client) => {
@@ -634,7 +723,9 @@ export default function LumiBotManagerApp() {
   function persistAccounts(nextRecords) {
     const normalized = nextRecords.map(normalizeAccountRecord);
     setAccountRecords(normalized);
-    saveAccountRecords(normalized);
+    saveAccountRecords(normalized).catch((error) => {
+      setNotice(error instanceof Error ? error.message : "계정 기록 저장에 실패했습니다.");
+    });
   }
 
   function updateForm(patch) {
