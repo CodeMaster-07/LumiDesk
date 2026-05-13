@@ -7,6 +7,7 @@ import {
   ChevronDown,
   ChevronUp,
   Clock3,
+  Copy,
   KeyRound,
   Link2,
   Lock,
@@ -70,6 +71,17 @@ const ACCOUNT_STATUS = {
   available: "사용 전",
   assigned: "고객 연결",
 };
+
+const ACCOUNT_INFO_FIELD_LABELS = {
+  four_part: ["이메일", "토큰 비밀번호", "이메일 비밀번호", "토큰"],
+  three_part: ["이메일", "토큰 비밀번호", "토큰"],
+  two_part: ["이메일", "이메일 비밀번호"],
+  token_only: ["토큰"],
+};
+
+const KNOWN_ACCOUNT_INFO_LABELS = new Set(
+  Object.values(ACCOUNT_INFO_FIELD_LABELS).flat(),
+);
 
 const DEFAULT_WEBHOOK_URL =
   "https://discord.com/api/webhooks/1502363881215889651/atAMoN9dOnAOZDgz2nim-ldtyuSgePim0h8v8nXIi4eBxVA_fRsWJ1obP50ILPQxY5uQ";
@@ -231,15 +243,60 @@ function hasDiscount(client) {
   return Number(client.discountAmount || 0) > 0 || client.discountType !== "none";
 }
 
-function detectAccountFormat(maskedHint) {
-  const value = String(maskedHint || "").trim();
-  if (!value) return "unknown";
-  const segments = value.split(":").map((segment) => segment.trim()).filter(Boolean);
-  if (segments.length === 1) return "token_only";
-  if (segments.length === 2) return value.includes("@") ? "two_part" : "unknown";
-  if (segments.length === 3) return "three_part";
-  if (segments.length === 4) return "four_part";
+function detectAccountFormatFromValues(values) {
+  if (values.length === 1) return "token_only";
+  if (values.length === 2) return values[0].includes("@") ? "two_part" : "unknown";
+  if (values.length === 3) return "three_part";
+  if (values.length === 4) return "four_part";
   return "unknown";
+}
+
+function getAccountInfoLabels(values, format = detectAccountFormatFromValues(values)) {
+  const configured = ACCOUNT_INFO_FIELD_LABELS[format];
+  if (configured?.length === values.length) return configured;
+  return values.map((_, index) => `항목 ${index + 1}`);
+}
+
+function parseAccountInfoSegments(value) {
+  const text = String(value || "").trim();
+  if (!text) return [];
+
+  const lines = text.split(/\n+/).map((line) => line.trim()).filter(Boolean);
+  const labeledLines = lines
+    .map((line) => {
+      const match = line.match(/^([^:\n]+):\s*(.+)$/);
+      if (!match) return null;
+      return { label: match[1].trim(), value: match[2].trim() };
+    })
+    .filter(Boolean);
+
+  const isStructuredSingleLine = labeledLines.length === 1
+    && (KNOWN_ACCOUNT_INFO_LABELS.has(labeledLines[0].label) || /^항목 \d+$/.test(labeledLines[0].label));
+
+  if ((lines.length > 1 && labeledLines.length === lines.length) || isStructuredSingleLine) {
+    return labeledLines.filter((item) => item.value);
+  }
+
+  const values = text.split(":").map((segment) => segment.trim()).filter(Boolean);
+  const labels = getAccountInfoLabels(values);
+  return values.map((segment, index) => ({ label: labels[index], value: segment }));
+}
+
+function detectAccountFormat(maskedHint) {
+  const segments = parseAccountInfoSegments(maskedHint);
+  return detectAccountFormatFromValues(segments.map((segment) => segment.value));
+}
+
+function formatAccountInfoForStorage(value) {
+  const segments = parseAccountInfoSegments(value);
+  if (segments.length === 0) return "";
+  return segments.map((segment) => `${segment.label}: ${segment.value}`).join("\n");
+}
+
+function formatAccountInfoCompact(value) {
+  const segments = parseAccountInfoSegments(value);
+  if (segments.length === 0) return "";
+  return segments.map((segment) => segment.value).join(":");
 }
 
 function readFileAsDataUrl(file) {
@@ -264,7 +321,7 @@ function emptyAccountForm() {
 }
 
 function normalizeAccountRecord(record) {
-  const maskedHint = String(record.maskedHint || "").trim();
+  const maskedHint = formatAccountInfoForStorage(record.maskedHint);
   const detectedFormat = detectAccountFormat(maskedHint);
   return {
     id: record.id ?? crypto.randomUUID(),
@@ -278,6 +335,27 @@ function normalizeAccountRecord(record) {
     detectedFormat,
     updatedAt: record.updatedAt || new Date().toISOString(),
   };
+}
+
+async function copyText(value) {
+  const text = String(value || "").trim();
+  if (!text) throw new Error("복사할 내용이 없습니다.");
+  if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(text);
+    return;
+  }
+  if (typeof document === "undefined") {
+    throw new Error("이 환경에서는 복사를 지원하지 않습니다.");
+  }
+  const textarea = document.createElement("textarea");
+  textarea.value = text;
+  textarea.setAttribute("readonly", "");
+  textarea.style.position = "fixed";
+  textarea.style.opacity = "0";
+  document.body.appendChild(textarea);
+  textarea.select();
+  document.execCommand("copy");
+  document.body.removeChild(textarea);
 }
 
 function openAccountRecordDb() {
@@ -597,6 +675,7 @@ export default function LumiBotManagerApp() {
   const [formOpen, setFormOpen] = useState(false);
   const [accountFormOpen, setAccountFormOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [linkedAccountsClientId, setLinkedAccountsClientId] = useState(null);
   const [editingId, setEditingId] = useState(null);
   const [editingAccountId, setEditingAccountId] = useState(null);
   const [form, setForm] = useState(emptyForm());
@@ -663,6 +742,26 @@ export default function LumiBotManagerApp() {
       ].some((value) => String(value || "").toLowerCase().includes(q));
     });
   }, [accountRecords, query]);
+
+  const linkedAccountsByBuyerId = useMemo(() => {
+    return accountRecords.reduce((map, record) => {
+      const buyerId = String(record.clientId || "").trim();
+      if (!buyerId) return map;
+      const current = map[buyerId] || [];
+      map[buyerId] = [...current, record];
+      return map;
+    }, {});
+  }, [accountRecords]);
+
+  const linkedAccountsClient = useMemo(
+    () => normalizedClients.find((client) => client.id === linkedAccountsClientId) || null,
+    [linkedAccountsClientId, normalizedClients],
+  );
+
+  const linkedAccountsForModal = useMemo(() => {
+    if (!linkedAccountsClient) return [];
+    return linkedAccountsByBuyerId[linkedAccountsClient.buyerId] || [];
+  }, [linkedAccountsByBuyerId, linkedAccountsClient]);
 
   const stats = useMemo(() => ({
     total: normalizedClients.length,
@@ -837,11 +936,34 @@ export default function LumiBotManagerApp() {
       } else {
         await persistAccounts([payload, ...accountRecords]);
       }
-      setNotice("계정 정보를 저장했습니다.");
+      setNotice("계정 정보를 보기 좋게 정리해 저장했습니다. 카드에서 전체 복사와 항목별 복사가 가능합니다.");
       closeAccountForm();
     } catch (error) {
       setAccountFormMessage(error instanceof Error ? error.message : "계정 기록 저장에 실패했습니다.");
     }
+  }
+
+  async function handleCopyAccountInfo(value, label) {
+    try {
+      await copyText(value);
+      setNotice(`${label} 복사를 완료했습니다.`);
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "복사에 실패했습니다.");
+    }
+  }
+
+  function openLinkedAccountsModal(client) {
+    setLinkedAccountsClientId(client.id);
+  }
+
+  function closeLinkedAccountsModal() {
+    setLinkedAccountsClientId(null);
+  }
+
+  function openAccountsTabForClient(client) {
+    setActiveTab(DASHBOARD_TABS.accounts);
+    setQuery(client.buyerId);
+    closeLinkedAccountsModal();
   }
 
   function deleteClient(id) {
@@ -1313,7 +1435,9 @@ export default function LumiBotManagerApp() {
                       <ClientRow
                         key={client.id}
                         client={client}
+                        linkedAccountCount={(linkedAccountsByBuyerId[client.buyerId] || []).length}
                         isExpanded={!!expanded[client.id]}
+                        onOpenLinkedAccounts={() => openLinkedAccountsModal(client)}
                         onToggle={() => toggleExpanded(client.id)}
                         onEdit={() => openEditForm(client)}
                         onDelete={() => deleteClient(client.id)}
@@ -1419,6 +1543,7 @@ export default function LumiBotManagerApp() {
                       record={record}
                       onEdit={() => openEditAccountForm(record)}
                       onDelete={() => deleteAccountRecord(record.id)}
+                      onCopy={handleCopyAccountInfo}
                     />
                   ))
                 )}
@@ -1429,6 +1554,67 @@ export default function LumiBotManagerApp() {
       </main>
 
       {/* Form modal */}
+      <AnimatePresence>
+        {linkedAccountsClient && (
+          <Overlay onClose={closeLinkedAccountsModal}>
+            <motion.div
+              transition={spring}
+              initial={{ opacity: 0, y: 20, scale: 0.97 }}
+              animate={{ opacity: 1, y: 0, scale: 1 }}
+              exit={{ opacity: 0, y: 20, scale: 0.97 }}
+              className="w-full max-w-4xl rounded-3xl border border-white/[0.08] p-6 shadow-[0_40px_100px_rgba(0,0,0,0.6)]"
+              style={{ background: "rgba(8,12,22,0.98)", backdropFilter: "blur(32px)" }}
+              onClick={(e) => e.stopPropagation()}
+            >
+              <ModalHeader
+                title={`${linkedAccountsClient.buyerId} 연결 계정`}
+                description="계약 관리 화면에서 연결된 계정 목록만 빠르게 확인합니다."
+                onClose={closeLinkedAccountsModal}
+              />
+
+              <div className="mb-4 grid gap-3 sm:grid-cols-4">
+                <SummaryBlock label="계약 상태" value={STATUS[linkedAccountsClient.displayStatus] || STATUS.pending} />
+                <SummaryBlock label="등록된 봇 수" value={`${linkedAccountsClient.botCount}개`} />
+                <SummaryBlock label="연결 계정 수" value={`${linkedAccountsForModal.length}개`} />
+                <SummaryBlock
+                  label="계약 기간"
+                  value={linkedAccountsClient.startDate && linkedAccountsClient.endDate ? `${linkedAccountsClient.startDate} ~ ${linkedAccountsClient.endDate}` : "기간 미설정"}
+                />
+              </div>
+
+              {linkedAccountsForModal.length === 0 ? (
+                <div className="rounded-2xl border border-white/[0.07] bg-white/[0.02] px-5 py-10 text-center">
+                  <div className="mx-auto mb-4 flex h-14 w-14 items-center justify-center rounded-2xl border border-white/[0.07] text-slate-600" style={{ background: "rgba(255,255,255,0.03)" }}>
+                    <Bot size={22} />
+                  </div>
+                  <p className="font-bold text-slate-300">연결된 계정이 아직 없습니다</p>
+                  <p className="mt-1 text-sm text-slate-600">계정 정리 탭에서 이 고객 아이디로 계정을 연결하면 여기에서 바로 확인할 수 있습니다.</p>
+                </div>
+              ) : (
+                <div className="grid gap-3">
+                  {linkedAccountsForModal.map((record) => (
+                    <LinkedAccountSummaryCard key={record.id} record={record} />
+                  ))}
+                </div>
+              )}
+
+              <div className="mt-5 flex gap-2">
+                <Button
+                  type="button"
+                  onClick={() => openAccountsTabForClient(linkedAccountsClient)}
+                  className="h-11 flex-1 rounded-xl text-sm"
+                >
+                  <Users size={15} className="mr-2" /> 계정 관리에서 이어서 보기
+                </Button>
+                <Button type="button" variant="outline" onClick={closeLinkedAccountsModal} className="h-11 rounded-xl px-5">
+                  닫기
+                </Button>
+              </div>
+            </motion.div>
+          </Overlay>
+        )}
+      </AnimatePresence>
+
       <AnimatePresence>
         {formOpen && (
           <Overlay onClose={closeForm}>
@@ -1630,7 +1816,7 @@ export default function LumiBotManagerApp() {
                     rows={4}
                     className="input resize-none py-3"
                     style={{ height: "auto" }}
-                    placeholder="user@site.com:token-pass:mail-pass:tok_xxxx"
+                    placeholder={"user@site.com:token-pass:mail-pass:tok_xxxx\n또는 여러 줄로 붙여넣기"}
                   />
                 </FormField>
                 <div className="rounded-2xl border border-white/[0.07] bg-white/[0.02] p-4">
@@ -1639,7 +1825,7 @@ export default function LumiBotManagerApp() {
                     {ACCOUNT_FORMAT_LABELS[detectAccountFormat(accountForm.maskedHint)]}
                   </div>
                   <p className="mt-3 text-xs leading-relaxed text-slate-500">
-                    입력한 계정 정보의 콜론(`:`) 개수와 이메일 포함 여부를 보고 형식을 분류합니다. 감지 결과가 애매하면 저장 후 `직접 확인 필요`로 표시됩니다.
+                    한 줄로 붙여넣어도 저장할 때 라벨이 붙은 여러 줄 블록으로 정리됩니다. 카드에서는 전체 복사와 항목별 복사를 바로 사용할 수 있습니다.
                   </p>
                 </div>
               </div>
@@ -1911,7 +2097,7 @@ function DaysLeftBadge({ left }) {
   );
 }
 
-function ClientRow({ client, isExpanded, onToggle, onEdit, onDelete }) {
+function ClientRow({ client, linkedAccountCount, isExpanded, onOpenLinkedAccounts, onToggle, onEdit, onDelete }) {
   const period =
     client.startDate && client.endDate
       ? `${client.startDate} ~ ${client.endDate}`
@@ -1945,7 +2131,15 @@ function ClientRow({ client, isExpanded, onToggle, onEdit, onDelete }) {
         {/* Bots */}
         <div>
           <p className="mb-0.5 text-[10px] font-bold uppercase tracking-wider text-slate-600 md:hidden">봇</p>
-          <span className="text-sm font-semibold text-slate-300">{client.botCount}개</span>
+          <button
+            type="button"
+            onClick={onOpenLinkedAccounts}
+            className="inline-flex items-center gap-2 rounded-xl border border-cyan-500/20 bg-cyan-500/[0.08] px-3 py-2 text-sm font-semibold text-cyan-100 transition hover:border-cyan-400/35 hover:bg-cyan-500/[0.14]"
+          >
+            <Bot size={15} className="text-cyan-300" />
+            <span>{client.botCount}개</span>
+          </button>
+          <p className="mt-1 text-[11px] text-slate-500">연결 계정 {linkedAccountCount}개 보기</p>
         </div>
 
         {/* Months */}
@@ -2033,10 +2227,56 @@ function ClientRow({ client, isExpanded, onToggle, onEdit, onDelete }) {
   );
 }
 
-function AccountRecordCard({ record, onEdit, onDelete }) {
+function LinkedAccountSummaryCard({ record }) {
+  const hasImage = Boolean(record.profileImageUrl);
+  const statusLabel = ACCOUNT_STATUS[record.status] || ACCOUNT_STATUS.available;
+  const formatLabel = ACCOUNT_FORMAT_LABELS[record.detectedFormat] || ACCOUNT_FORMAT_LABELS.unknown;
+  const hasStoredInfo = parseAccountInfoSegments(record.maskedHint).length > 0;
+
+  return (
+    <div className="rounded-2xl border border-white/[0.07] bg-white/[0.02] p-4">
+      <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
+        <div className="flex min-w-0 gap-4">
+          <div
+            className="flex h-14 w-14 flex-shrink-0 items-center justify-center overflow-hidden rounded-2xl border border-white/[0.08] bg-white/[0.04]"
+            style={{ boxShadow: hasImage ? "0 0 18px rgba(56,189,248,0.12)" : "none" }}
+          >
+            {hasImage ? (
+              <img src={record.profileImageUrl} alt={record.promoterName} className="h-full w-full object-cover" />
+            ) : (
+              <span className="text-sm font-black text-slate-500">{record.promoterName.slice(0, 1) || "?"}</span>
+            )}
+          </div>
+
+          <div className="min-w-0">
+            <div className="flex flex-wrap items-center gap-2">
+              <h3 className="truncate text-base font-black text-white">{record.promoterName}</h3>
+              <AccountStatusBadge status={record.status} />
+            </div>
+            <p className="mt-1 text-sm text-slate-400">{statusLabel} · {formatLabel}</p>
+            <div className="mt-3 grid gap-2 sm:grid-cols-2">
+              <AccountMeta label="외부 보관 참조">{record.vaultReference || "참조 ID 없음"}</AccountMeta>
+              <AccountMeta label="저장 상태">{hasStoredInfo ? "계정 정보 저장됨" : "저장 정보 없음"}</AccountMeta>
+            </div>
+          </div>
+        </div>
+
+        <div className="text-xs text-slate-500">최근 수정 {formatDateTime(record.updatedAt)}</div>
+      </div>
+
+      <div className="mt-3 rounded-xl border border-white/[0.06] bg-black/10 px-4 py-3 text-sm text-slate-300">
+        {record.note || <span className="text-slate-600">메모 없음</span>}
+      </div>
+    </div>
+  );
+}
+
+function AccountRecordCard({ record, onEdit, onDelete, onCopy }) {
   const formatLabel = ACCOUNT_FORMAT_LABELS[record.detectedFormat] || ACCOUNT_FORMAT_LABELS.unknown;
   const hasImage = Boolean(record.profileImageUrl);
   const statusLabel = ACCOUNT_STATUS[record.status] || ACCOUNT_STATUS.available;
+  const accountInfoSegments = parseAccountInfoSegments(record.maskedHint);
+  const compactAccountInfo = formatAccountInfoCompact(record.maskedHint);
 
   return (
     <motion.div
@@ -2069,9 +2309,14 @@ function AccountRecordCard({ record, onEdit, onDelete }) {
               </span>
             </div>
             <p className="mt-1 text-sm text-slate-400">{statusLabel} · {formatLabel}</p>
-            <div className="mt-3 grid gap-2 sm:grid-cols-2">
+            <div className="mt-3 grid gap-3">
               <AccountMeta label="외부 보관 참조">{record.vaultReference || "참조 ID 없음"}</AccountMeta>
-              <AccountMeta label="계정 정보">{record.maskedHint || "저장된 정보 없음"}</AccountMeta>
+              <AccountInfoPanel
+                segments={accountInfoSegments}
+                compactValue={compactAccountInfo}
+                prettyValue={record.maskedHint}
+                onCopy={onCopy}
+              />
             </div>
           </div>
         </div>
@@ -2123,6 +2368,53 @@ function AccountMeta({ label, children }) {
       <div className="mb-1 text-[10px] font-bold uppercase tracking-widest text-slate-500">{label}</div>
       <div className="break-all text-sm text-slate-200">{children}</div>
     </div>
+  );
+}
+
+function AccountInfoPanel({ segments, compactValue, prettyValue, onCopy }) {
+  return (
+    <div className="rounded-xl border border-white/[0.06] bg-white/[0.02] px-3 py-3">
+      <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+        <div className="text-[10px] font-bold uppercase tracking-widest text-slate-500">계정 정보</div>
+        <div className="flex flex-wrap gap-1.5">
+          <CopyAction label="한 줄 복사" onClick={() => onCopy(compactValue, "계정 정보 한 줄")} disabled={!compactValue} />
+          <CopyAction label="블록 복사" onClick={() => onCopy(prettyValue, "정리된 계정 정보")} disabled={!prettyValue} />
+        </div>
+      </div>
+
+      {segments.length === 0 ? (
+        <div className="text-sm text-slate-500">저장된 정보 없음</div>
+      ) : (
+        <div className="grid gap-2 sm:grid-cols-2">
+          {segments.map((segment, index) => (
+            <div
+              key={`${segment.label}-${index}`}
+              className="rounded-xl border border-white/[0.06] bg-black/10 px-3 py-2.5"
+            >
+              <div className="mb-2 flex items-center justify-between gap-2">
+                <span className="text-[10px] font-bold uppercase tracking-widest text-slate-500">{segment.label}</span>
+                <CopyAction label="복사" onClick={() => onCopy(segment.value, segment.label)} compact />
+              </div>
+              <div className="break-all text-sm text-slate-100">{segment.value}</div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function CopyAction({ label, onClick, disabled = false, compact = false }) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={disabled}
+      className={`inline-flex items-center gap-1 rounded-full border border-violet-500/20 bg-violet-500/[0.08] font-semibold text-violet-200 transition hover:border-violet-500/35 hover:bg-violet-500/[0.14] disabled:cursor-not-allowed disabled:opacity-40 ${compact ? "px-2 py-1 text-[10px]" : "px-2.5 py-1 text-[11px]"}`}
+    >
+      <Copy size={compact ? 11 : 12} />
+      {label}
+    </button>
   );
 }
 
