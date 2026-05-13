@@ -248,6 +248,15 @@ function looksLikeRawCredential(value) {
   return /[A-Za-z0-9_\-.]{24,}/.test(text);
 }
 
+function readFileAsDataUrl(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || ""));
+    reader.onerror = () => reject(new Error("이미지 파일을 읽는 중 오류가 발생했습니다."));
+    reader.readAsDataURL(file);
+  });
+}
+
 function emptyAccountForm() {
   return {
     status: "available",
@@ -685,6 +694,30 @@ export default function LumiBotManagerApp() {
     setAccountFormOpen(false);
     setEditingAccountId(null);
     setAccountForm(emptyAccountForm());
+  }
+
+  async function handleAccountImageUpload(event) {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    if (!file.type.startsWith("image/")) {
+      setNotice("이미지 파일만 업로드할 수 있습니다.");
+      event.target.value = "";
+      return;
+    }
+    if (file.size > 2 * 1024 * 1024) {
+      setNotice("이미지는 2MB 이하 파일로 업로드해 주세요.");
+      event.target.value = "";
+      return;
+    }
+    try {
+      const dataUrl = await readFileAsDataUrl(file);
+      setAccountForm((prev) => ({ ...prev, profileImageUrl: dataUrl }));
+      setNotice("프로필 이미지를 업로드했습니다.");
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "이미지 업로드에 실패했습니다.");
+    } finally {
+      event.target.value = "";
+    }
   }
 
   function submitForm(event) {
@@ -1457,13 +1490,38 @@ export default function LumiBotManagerApp() {
                     placeholder="promo_worker_alpha"
                   />
                 </FormField>
-                <FormField label="프로필 이미지 URL">
-                  <input
-                    value={accountForm.profileImageUrl}
-                    onChange={(e) => setAccountForm((prev) => ({ ...prev, profileImageUrl: e.target.value }))}
-                    className="input"
-                    placeholder="https://cdn.example.com/avatar.png"
-                  />
+                <FormField label="프로필 이미지 업로드">
+                  <div className="rounded-2xl border border-white/[0.07] bg-white/[0.02] p-3">
+                    <div className="flex items-center gap-3">
+                      <div className="flex h-14 w-14 flex-shrink-0 items-center justify-center overflow-hidden rounded-2xl border border-white/[0.08] bg-white/[0.04]">
+                        {accountForm.profileImageUrl ? (
+                          <img src={accountForm.profileImageUrl} alt="프로필 미리보기" className="h-full w-full object-cover" />
+                        ) : (
+                          <span className="text-xs font-bold text-slate-500">미리보기</span>
+                        )}
+                      </div>
+                      <div className="min-w-0 flex-1">
+                        <label className="inline-flex cursor-pointer items-center rounded-xl border border-violet-500/25 bg-violet-500/[0.08] px-3 py-2 text-sm font-semibold text-violet-200 transition hover:border-violet-500/40 hover:bg-violet-500/[0.14]">
+                          파일 선택
+                          <input type="file" accept="image/*" className="hidden" onChange={handleAccountImageUpload} />
+                        </label>
+                        <p className="mt-2 text-xs leading-relaxed text-slate-500">
+                          JPG, PNG, WEBP 이미지 업로드 가능. 2MB 이하 권장
+                        </p>
+                      </div>
+                    </div>
+                    {accountForm.profileImageUrl && (
+                      <div className="mt-3">
+                        <button
+                          type="button"
+                          onClick={() => setAccountForm((prev) => ({ ...prev, profileImageUrl: "" }))}
+                          className="text-xs font-semibold text-rose-300 transition hover:text-rose-200"
+                        >
+                          업로드한 이미지 제거
+                        </button>
+                      </div>
+                    )}
+                  </div>
                 </FormField>
                 <FormField label="외부 보관 참조 ID">
                   <input
