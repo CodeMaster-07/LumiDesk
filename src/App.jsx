@@ -610,6 +610,7 @@ export default function LumiBotManagerApp() {
   const [editingAccountId, setEditingAccountId] = useState(null);
   const [form, setForm] = useState(emptyForm());
   const [accountForm, setAccountForm] = useState(emptyAccountForm());
+  const [accountFormMessage, setAccountFormMessage] = useState("");
   const [notice, setNotice] = useState("웹훅이 연결되면 1분마다 결제일과 만료 3일/2일/1일 전 및 당일 알림을 확인합니다.");
 
   const sentNotificationsRef = useRef(getSavedNotificationLog());
@@ -720,12 +721,10 @@ export default function LumiBotManagerApp() {
     saveClients(normalized);
   }
 
-  function persistAccounts(nextRecords) {
+  async function persistAccounts(nextRecords) {
     const normalized = nextRecords.map(normalizeAccountRecord);
     setAccountRecords(normalized);
-    saveAccountRecords(normalized).catch((error) => {
-      setNotice(error instanceof Error ? error.message : "계정 기록 저장에 실패했습니다.");
-    });
+    await saveAccountRecords(normalized);
   }
 
   function updateForm(patch) {
@@ -764,6 +763,7 @@ export default function LumiBotManagerApp() {
   function openCreateAccountForm() {
     setEditingAccountId(null);
     setAccountForm(emptyAccountForm());
+    setAccountFormMessage("");
     setAccountFormOpen(true);
   }
 
@@ -778,6 +778,7 @@ export default function LumiBotManagerApp() {
       maskedHint: record.maskedHint,
       note: record.note,
     });
+    setAccountFormMessage("");
     setAccountFormOpen(true);
   }
 
@@ -785,27 +786,28 @@ export default function LumiBotManagerApp() {
     setAccountFormOpen(false);
     setEditingAccountId(null);
     setAccountForm(emptyAccountForm());
+    setAccountFormMessage("");
   }
 
   async function handleAccountImageUpload(event) {
     const file = event.target.files?.[0];
     if (!file) return;
     if (!file.type.startsWith("image/")) {
-      setNotice("이미지 파일만 업로드할 수 있습니다.");
+      setAccountFormMessage("이미지 파일만 업로드할 수 있습니다.");
       event.target.value = "";
       return;
     }
     if (file.size > 2 * 1024 * 1024) {
-      setNotice("이미지는 2MB 이하 파일로 업로드해 주세요.");
+      setAccountFormMessage("이미지는 2MB 이하 파일로 업로드해 주세요.");
       event.target.value = "";
       return;
     }
     try {
       const dataUrl = await readFileAsDataUrl(file);
       setAccountForm((prev) => ({ ...prev, profileImageUrl: dataUrl }));
-      setNotice("프로필 이미지를 업로드했습니다.");
+      setAccountFormMessage("프로필 이미지를 업로드했습니다.");
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : "이미지 업로드에 실패했습니다.");
+      setAccountFormMessage(error instanceof Error ? error.message : "이미지 업로드에 실패했습니다.");
     } finally {
       event.target.value = "";
     }
@@ -823,10 +825,10 @@ export default function LumiBotManagerApp() {
     closeForm();
   }
 
-  function submitAccountForm(event) {
+  async function submitAccountForm(event) {
     event.preventDefault();
     if (looksLikeRawCredential(accountForm.maskedHint)) {
-      setNotice("계정 정리 탭에는 원문 토큰이나 비밀번호를 저장할 수 없습니다. 마스킹 힌트만 남겨주세요.");
+      setAccountFormMessage("원문 토큰이나 비밀번호는 저장할 수 없습니다. 마스킹 힌트만 남겨주세요.");
       return;
     }
     const payload = normalizeAccountRecord({
@@ -834,18 +836,25 @@ export default function LumiBotManagerApp() {
       id: editingAccountId ?? crypto.randomUUID(),
       updatedAt: new Date().toISOString(),
     });
-    if (!payload.promoterName) return;
-    if (payload.status === "assigned" && !payload.clientId) {
-      setNotice("고객에게 연결된 계정은 고객 아이디를 함께 입력해 주세요.");
+    if (!payload.promoterName) {
+      setAccountFormMessage("홍보 계정 표시명을 입력해 주세요.");
       return;
     }
-    if (editingAccountId) {
-      persistAccounts(accountRecords.map((record) => (record.id === editingAccountId ? payload : record)));
-    } else {
-      persistAccounts([payload, ...accountRecords]);
+    if (payload.status === "assigned" && !payload.clientId) {
+      setAccountFormMessage("고객에게 연결된 계정은 고객 아이디를 함께 입력해 주세요.");
+      return;
     }
-    setNotice("계정 참조 기록을 저장했습니다.");
-    closeAccountForm();
+    try {
+      if (editingAccountId) {
+        await persistAccounts(accountRecords.map((record) => (record.id === editingAccountId ? payload : record)));
+      } else {
+        await persistAccounts([payload, ...accountRecords]);
+      }
+      setNotice("계정 참조 기록을 저장했습니다.");
+      closeAccountForm();
+    } catch (error) {
+      setAccountFormMessage(error instanceof Error ? error.message : "계정 기록 저장에 실패했습니다.");
+    }
   }
 
   function deleteClient(id) {
@@ -853,8 +862,9 @@ export default function LumiBotManagerApp() {
   }
 
   function deleteAccountRecord(id) {
-    persistAccounts(accountRecords.filter((record) => record.id !== id));
-    setNotice("계정 참조 기록을 삭제했습니다.");
+    persistAccounts(accountRecords.filter((record) => record.id !== id))
+      .then(() => setNotice("계정 참조 기록을 삭제했습니다."))
+      .catch((error) => setNotice(error instanceof Error ? error.message : "계정 기록 삭제에 실패했습니다."));
   }
 
   function toggleExpanded(id) {
@@ -1579,6 +1589,7 @@ export default function LumiBotManagerApp() {
                     onChange={(e) => setAccountForm((prev) => ({ ...prev, promoterName: e.target.value }))}
                     className="input"
                     placeholder="promo_worker_alpha"
+                    required
                   />
                 </FormField>
                 <FormField label="프로필 이미지 업로드">
@@ -1659,7 +1670,11 @@ export default function LumiBotManagerApp() {
                 </FormField>
               </div>
 
-              <div className="mt-5 flex gap-2">
+              <div className="mt-5 flex items-center gap-3">
+                <p className="flex-1 text-xs text-slate-400">{accountFormMessage || "저장 시 계정 정리 탭과 목록에 바로 반영됩니다."}</p>
+              </div>
+
+              <div className="mt-3 flex gap-2">
                 <Button type="submit" className="h-11 flex-1 rounded-xl text-sm">
                   <Save size={16} className="mr-2" /> 저장하기
                 </Button>
